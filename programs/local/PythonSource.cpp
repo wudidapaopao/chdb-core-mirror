@@ -123,6 +123,83 @@ void PythonSource::insert_string_from_array(const py::handle obj, const MutableC
     }
 }
 
+/// If `obj` is a pandas Series backed by ArrowStringArray (pandas >= 3 default
+/// or `pd.options.future.infer_string = True`), copy the Arrow string buffer
+/// directly into the ColumnString without materializing per-row PyUnicode.
+/// Returns true on success; caller falls back to the generic path on false.
+static bool try_insert_arrow_string_series(const py::object & obj, const MutableColumnPtr & column)
+{
+    py::gil_scoped_acquire acquire;
+    try
+    {
+        if (!py::hasattr(obj, "array"))
+            return false;
+        py::object pd_arr = obj.attr("array");
+        std::string arr_cls = py::str(pd_arr.attr("__class__").attr("__name__"));
+        if (arr_cls != "ArrowStringArray" && arr_cls != "ArrowExtensionArray")
+            return false;
+        if (!py::hasattr(pd_arr, "_pa_array"))
+            return false;
+        py::object pa_arr = pd_arr.attr("_pa_array");
+        std::string pa_type = py::str(pa_arr.attr("type"));
+        if (pa_type != "string" && pa_type != "large_string")
+            return false;
+
+        ColumnString * string_column = typeid_cast<ColumnString *>(column.get());
+        if (!string_column)
+            return false;
+
+        py::object combined = pa_arr.attr("combine_chunks")();
+        py::list buffers = combined.attr("buffers")();
+        if (buffers.size() < 3)
+            return false;
+
+        py::object offsets_buf = buffers[1];
+        py::object data_buf = buffers[2];
+        const auto offsets_ptr = reinterpret_cast<const int32_t *>(
+            py::cast<uintptr_t>(offsets_buf.attr("address")));
+        const auto data_ptr = reinterpret_cast<const char *>(
+            py::cast<uintptr_t>(data_buf.attr("address")));
+        const size_t length = py::cast<size_t>(combined.attr("__len__")());
+
+        auto & ch_chars = string_column->getChars();
+        auto & ch_offsets = string_column->getOffsets();
+        ch_offsets.reserve(ch_offsets.size() + length);
+
+        const int32_t base_offset = length ? offsets_ptr[0] : 0;
+        const size_t total_bytes = length ? (offsets_ptr[length] - base_offset) : 0;
+        ch_chars.reserve(ch_chars.size() + total_bytes + length); /// trailing null per row
+
+        py::object validity_buf = buffers[0];
+        const bool has_nulls = !validity_buf.is_none();
+        const uint8_t * validity_ptr = has_nulls
+            ? reinterpret_cast<const uint8_t *>(py::cast<uintptr_t>(validity_buf.attr("address")))
+            : nullptr;
+
+        for (size_t i = 0; i < length; ++i)
+        {
+            if (validity_ptr && !(validity_ptr[i / 8] & (1u << (i % 8))))
+            {
+                string_column->insertDefault();
+                continue;
+            }
+            const int32_t start = offsets_ptr[i];
+            const int32_t end = offsets_ptr[i + 1];
+            string_column->insertData(data_ptr + start, end - start);
+        }
+        return true;
+    }
+    catch (const py::error_already_set &)
+    {
+        PyErr_Clear();
+        return false;
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
 void PythonSource::convert_string_array_to_block(
     PyObject ** buf, const MutableColumnPtr & column, const size_t offset, const size_t row_count, size_t stride)
 {
@@ -201,6 +278,12 @@ ColumnPtr PythonSource::convert_and_insert(const py::object & obj, UInt32 scale,
         column = ColumnString::create();
     else
         column = ColumnVector<T>::create();
+
+    if constexpr (std::is_same_v<T, String>)
+    {
+        if (!is_json && try_insert_arrow_string_series(obj, column))
+            return column;
+    }
 
     std::string type_name;
     size_t row_count = 0;

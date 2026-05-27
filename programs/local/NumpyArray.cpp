@@ -28,6 +28,7 @@
 #include <DataTypes/DataTypeTime64.h>
 #include <Interpreters/castColumn.h>
 #include <base/Decimal.h>
+#include <unordered_map>
 #include <base/types.h>
 #include <Common/formatIPv6.h>
 #include <pybind11/pytypes.h>
@@ -568,7 +569,6 @@ static bool CHColumnStringToNumpyArray(NumpyAppendData & append_data)
 	const IColumn * data_column = &append_data.column;
 	const ColumnNullable * nullable_column = nullptr;
 
-	/// Check if column is nullable
 	if (const auto * nullable = typeid_cast<const ColumnNullable *>(&append_data.column))
 	{
 		nullable_column = nullable;
@@ -581,6 +581,14 @@ static bool CHColumnStringToNumpyArray(NumpyAppendData & append_data)
 
 	auto * dest_ptr = reinterpret_cast<PyObject **>(append_data.target_data);
 
+	/// Reuse PyUnicode objects for repeated string values (dimension columns,
+	/// low-cardinality data). Cache capped to keep memory bounded on
+	/// high-cardinality columns; once full we fall back to per-row allocation.
+	static constexpr size_t MAX_DEDUP_ENTRIES = 4096;
+	std::unordered_map<std::string_view, PyObject *> dedup_cache;
+	std::vector<PyObject *> cache_owned_refs;
+	bool dedup_active = true;
+
 	for (size_t i = 0; i < append_data.src_count; i++)
 	{
 		size_t src_index = append_data.src_offset + i;
@@ -589,21 +597,49 @@ static bool CHColumnStringToNumpyArray(NumpyAppendData & append_data)
 		{
 			Py_INCREF(Py_None);
 			dest_ptr[dest_index] = Py_None;
+			continue;
 		}
-		else
+
+		std::string_view str_ref = string_column->getDataAt(src_index);
+
+		if (dedup_active)
 		{
-			std::string_view str_ref = string_column->getDataAt(src_index);
-			auto * str_ptr = const_cast<char *>(str_ref.data());
-			auto str_size = str_ref.size();
-			PyObject * py_str = PyUnicode_DecodeUTF8(str_ptr, str_size, nullptr);
-			if (!py_str)
+			auto it = dedup_cache.find(str_ref);
+			if (it != dedup_cache.end())
 			{
-				PyErr_Clear();
-				py_str = PyByteArray_FromStringAndSize(str_ptr, str_size);
+				Py_INCREF(it->second);
+				dest_ptr[dest_index] = it->second;
+				continue;
 			}
-			dest_ptr[dest_index] = py_str;
+		}
+
+		auto * str_ptr = const_cast<char *>(str_ref.data());
+		auto str_size = str_ref.size();
+		PyObject * py_str = PyUnicode_DecodeUTF8(str_ptr, str_size, nullptr);
+		if (!py_str)
+		{
+			PyErr_Clear();
+			py_str = PyByteArray_FromStringAndSize(str_ptr, str_size);
+		}
+		dest_ptr[dest_index] = py_str;
+
+		if (dedup_active)
+		{
+			if (dedup_cache.size() < MAX_DEDUP_ENTRIES)
+			{
+				Py_INCREF(py_str);
+				dedup_cache.emplace(str_ref, py_str);
+				cache_owned_refs.push_back(py_str);
+			}
+			else
+			{
+				dedup_active = false;
+			}
 		}
 	}
+
+	for (PyObject * obj : cache_owned_refs)
+		Py_DECREF(obj);
 
 	return has_null;
 }
